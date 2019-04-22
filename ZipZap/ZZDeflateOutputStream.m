@@ -13,6 +13,27 @@
 
 static const uInt _flushLength = 1024;
 
+
+@interface ZZRunLoopSource: NSObject
+
++ (instancetype)sourceScheduledInRunloop:(NSRunLoop *)runloop mode:(NSRunLoopMode)mode order:(NSUInteger)order handlingBlock:(void(^)(void))block;
+
+@property (strong) NSRunLoop *runLoop;
+@property  NSRunLoopMode mode;
+@property  NSUInteger order;
+@property  (copy) void(^performBlock)(void);
+
+- (void)schedule;
+- (void)unschedule;
+- (void)signal;
+
+@end
+
+@interface ZZDeflateOutputStream () <NSStreamDelegate>
+
+@end
+
+
 @implementation ZZDeflateOutputStream
 {
 	id<ZZChannelOutput> _channelOutput;
@@ -21,6 +42,10 @@ static const uInt _flushLength = 1024;
 	NSError* _error;
 	uint32_t _crc32;
 	z_stream _stream;
+	
+	id<NSStreamDelegate> _delegate;
+	NSMutableArray<ZZRunLoopSource *> *_runLoopSources;
+	NSMutableArray<NSNumber *> *_eventQueue;
 }
 
 @synthesize crc32 = _crc32;
@@ -41,8 +66,15 @@ static const uInt _flushLength = 1024;
 		_stream.opaque = Z_NULL;
 		_stream.next_in = Z_NULL;
 		_stream.avail_in = 0;
+		
+		_runLoopSources = [[NSMutableArray alloc] init];
 	}
 	return self;
+}
+
+- (void)dealloc
+{
+	[_runLoopSources makeObjectsPerformSelector:@selector(unschedule)];
 }
 
 - (uint32_t)compressedSize
@@ -74,6 +106,8 @@ static const uInt _flushLength = 1024;
 				 8,
 				 Z_DEFAULT_STRATEGY);
 	_status = NSStreamStatusOpen;
+	[self enqueueEvent:NSStreamEventOpenCompleted];
+	[self enqueueEvent:NSStreamEventHasSpaceAvailable];
 }
 
 - (void)close
@@ -141,6 +175,7 @@ static const uInt _flushLength = 1024;
 	NSUInteger bytesWritten = length - _stream.avail_in;
 	_crc32 = (uint32_t)crc32(_crc32, buffer, (uInt)bytesWritten);
 	
+	[self enqueueEvent:NSStreamEventHasSpaceAvailable];
 	return bytesWritten;
 }
 
@@ -149,4 +184,146 @@ static const uInt _flushLength = 1024;
 	return YES;
 }
 
+- (id<NSStreamDelegate>)delegate
+{
+	return _delegate;
+}
+
+- (void)setDelegate:(id<NSStreamDelegate>)delegate
+{
+	_delegate = delegate;
+	if (_delegate == nil) {
+		_delegate = self;
+	}
+}
+
+#pragma mark - Runloop handling
+
+- (void)enqueueEvent:(NSStreamEvent)event
+{
+	[_eventQueue addObject:@(event)];
+    [_runLoopSources makeObjectsPerformSelector:@selector(signal)];
+}
+
+- (NSStreamEvent)dequeueEvent
+{
+	NSNumber *e = [_eventQueue firstObject];
+	if (e == nil) {
+		return NSStreamEventNone;
+	} else {
+		[_eventQueue removeObjectAtIndex:0];
+	}
+
+    if ([_eventQueue count] > 0) {
+        [_runLoopSources makeObjectsPerformSelector:@selector(signal)];
+    }
+	return [e unsignedIntegerValue];
+}
+
+- (void)dequeueAndNotify
+{
+	NSStreamEvent event = [self dequeueEvent];
+	if (event != NSStreamEventNone) {
+		[self.delegate stream:self handleEvent:event];
+	}
+}
+
+- (void)scheduleInRunLoop:(NSRunLoop *)aRunLoop forMode:(NSRunLoopMode)mode
+{
+	__weak ZZDeflateOutputStream *wSelf = self;
+	ZZRunLoopSource *source = [ZZRunLoopSource sourceScheduledInRunloop:aRunLoop mode:mode order:0 handlingBlock:^{
+		[wSelf dequeueAndNotify];
+	}];
+	
+	[_runLoopSources addObject:source];
+	if (_eventQueue == nil) {
+		_eventQueue = [[NSMutableArray alloc] init];
+	}
+}
+
+- (void)removeFromRunLoop:(NSRunLoop *)aRunLoop forMode:(NSRunLoopMode)mode
+{
+	ZZRunLoopSource *source = nil;
+	for (ZZRunLoopSource *aSource in _runLoopSources) {
+		if ([aSource.runLoop isEqual:aRunLoop] && [aSource.mode isEqualToString:mode]) {
+			source = aSource;
+			break;
+		}
+	}
+	[_runLoopSources removeObject:source];
+	[source unschedule];
+	
+	if ([_runLoopSources count] == 0) {
+		_eventQueue = nil;
+	}
+}
+
+
+
 @end
+
+
+static void runLoopSourceCallback(void *info);
+
+@implementation ZZRunLoopSource {
+	CFRunLoopSourceRef _sourceRef;
+}
+
++ (instancetype)sourceScheduledInRunloop:(NSRunLoop *)runloop mode:(NSRunLoopMode)mode order:(NSUInteger)order handlingBlock:(void (^)(void))block
+{
+	ZZRunLoopSource *source = [[ZZRunLoopSource alloc] init];
+	source.runLoop = runloop;
+	source.order = order;
+	source.mode = mode;
+	source.performBlock = block;
+	[source schedule];
+	return source;
+}
+
+- (void)dealloc
+{
+	[self unschedule];
+}
+
+- (CFRunLoopSourceRef)getSourceRef
+{
+	if (_sourceRef == NULL) {
+		
+	}
+	return _sourceRef;
+}
+
+- (void)schedule
+{
+	if(_sourceRef == NULL) {
+		CFRunLoopSourceContext context;
+        bzero(&context, sizeof(CFRunLoopSourceContext));
+		context.info = (__bridge void *)(self);
+		context.perform = runLoopSourceCallback;
+		_sourceRef = CFRunLoopSourceCreate(NULL, self.order, &context);
+		CFRunLoopAddSource([self.runLoop getCFRunLoop], _sourceRef, (CFRunLoopMode)self.mode);
+	}
+}
+
+- (void)unschedule
+{
+	if (_sourceRef != NULL){
+		CFRunLoopRemoveSource([self.runLoop getCFRunLoop], _sourceRef, (CFRunLoopMode)self.mode);
+		CFRelease(_sourceRef);
+		_sourceRef = NULL;
+	}
+}
+
+- (void)signal
+{
+	if (_sourceRef) {
+		CFRunLoopSourceSignal(_sourceRef);
+	}
+}
+
+@end
+
+static void runLoopSourceCallback(void *info){
+	ZZRunLoopSource *source = (__bridge ZZRunLoopSource *)info;
+	source.performBlock();
+}
