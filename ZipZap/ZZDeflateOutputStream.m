@@ -147,22 +147,34 @@ static const uInt _flushLength = 1024;
 {
 	// allocate an output buffer large enough to fit deflated output
 	// NOTE: we ensure that we can deflate at least one byte, since write:maxLength: need not deflate all bytes
-	uLong maxLength = deflateBound(&_stream, length);
-	NSMutableData* outputBuffer = [[NSMutableData alloc] initWithLength:maxLength];
 	
-	// deflate buffer to output buffer
+	int ret;
+	uLong have = 0;
+	uLong maxLength = deflateBound(&_stream, length);
+	uint8_t outBuffer[maxLength];
 	_stream.next_in = (Bytef*)buffer;
 	_stream.avail_in = (uInt)length;
-	_stream.next_out = (Bytef*)outputBuffer.mutableBytes;
-	_stream.avail_out = (uInt)maxLength;
-	deflate(&_stream, Z_NO_FLUSH);
+	
+	NSMutableData *compressedData = [NSMutableData data];
+	
+	/* we must call deflate enough times consume all input or write all output (in case we're finishing) */
+	do {
+		_stream.avail_out = (uInt)maxLength;
+		_stream.next_out = outBuffer;
+		
+		ret = deflate(&_stream, Z_NO_FLUSH);       /* no bad return value */
+		assert(ret != Z_STREAM_ERROR);      /* state not clobbered */
+		
+		have = maxLength - _stream.avail_out;
+		[compressedData appendBytes:outBuffer length:have];
+		
+	} while (_stream.avail_in > 0 || have > 0);
 	
 	// write out deflated output if any
-	outputBuffer.length = maxLength - _stream.avail_out;
-	if (outputBuffer.length > 0)
+	if (compressedData.length > 0)
 	{
 		NSError* __autoreleasing writeError;
-		if (![_channelOutput writeData:outputBuffer
+		if (![_channelOutput writeData:compressedData
 								 error:&writeError])
 		{
 			_status = NSStreamStatusError;
